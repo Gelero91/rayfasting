@@ -1,0 +1,1223 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raycaster Wolfenstein 3D avec Portes et Sprites</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: monospace;
+            color: #fff;
+        }
+        #gameContainer {
+            position: relative;
+        }
+        canvas {
+            border: 2px solid #333;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="canvas"></canvas>
+        <div id="info">
+            <div>FPS: <span id="fps">0</span></div>
+            <div>Position: <span id="pos">0, 0</span></div>
+            <div>Cellule: <span id="cell">0, 0</span></div>
+            <div>Rayons: <span id="rays">0</span></div>
+            <div>Portes actives: <span id="doors">0</span></div>
+            <div>Sprites visibles: <span id="sprites">0</span></div>
+        </div>
+        <div id="controls">
+            WASD: Déplacement | Q/E: Rotation | ↑↓: Avancer/Reculer | ←→: Tourner | ESPACE: Ouvrir porte
+        </div>
+    </div>
+
+    <script>
+        const SCREEN_WIDTH = 640;
+        const SCREEN_HEIGHT = 400;
+        const TEXTURE_SIZE = 64;
+        const MAP_WIDTH = 24;
+        const MAP_HEIGHT = 24;
+        const FOV = Math.PI / 3; // 60 degrés
+        const HALF_FOV = FOV / 2;
+        const NUM_RAYS = Math.floor(SCREEN_WIDTH / 2); // Optimisation: moins de rayons
+        const MAX_DEPTH = 20;
+        const FOG_START = 8;
+        const FOG_END = 16;
+        const PLAYER_SPEED = 2.5;
+        const ROTATION_SPEED = 2.0;
+        const PLAYER_RADIUS = 0.25;
+        const DOOR_SPEED = 2.0; // Vitesse d'ouverture des portes
+        
+        // Types de cellules
+        const CELL_EMPTY = 0;
+        const CELL_WALL = 1;
+        const CELL_DOOR_NS = 10; // Porte Nord-Sud
+        const CELL_DOOR_EW = 11; // Porte Est-Ouest
+        
+        // États des portes
+        const DOOR_CLOSED = 0;
+        const DOOR_OPENING = 1;
+        const DOOR_OPEN = 2;
+        const DOOR_CLOSING = 3;
+        
+        // Types de sprites
+        const SPRITE_LAMP = 0;
+        const SPRITE_PILLAR = 1;
+        const SPRITE_PLANT = 2;
+        const SPRITE_ARMOR = 3;
+        const SPRITE_HEALTH = 4;
+        
+        // Canvas et contexte
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = SCREEN_WIDTH;
+        canvas.height = SCREEN_HEIGHT;
+        
+        // Buffer de pixels pour manipulation directe
+        let imageData = ctx.createImageData(SCREEN_WIDTH, SCREEN_HEIGHT);
+        let pixelBuffer = new Uint32Array(imageData.data.buffer);
+        
+        // Tables de précalcul
+        const sinTable = new Float32Array(360);
+        const cosTable = new Float32Array(360);
+        const tanTable = new Float32Array(360);
+        
+        // Initialisation des tables trigonométriques
+        for (let i = 0; i < 360; i++) {
+            const angle = (i * Math.PI) / 180;
+            sinTable[i] = Math.sin(angle);
+            cosTable[i] = Math.cos(angle);
+            tanTable[i] = Math.tan(angle);
+        }
+        
+        // Génération de textures aléatoires
+        class TextureGenerator {
+            static generateWallTexture(baseColor) {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                const r = (baseColor >> 16) & 0xff;
+                const g = (baseColor >> 8) & 0xff;
+                const b = baseColor & 0xff;
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        let noise = Math.random() * 40 - 20;
+                        let shade = 1.0;
+                        
+                        // Motif de briques
+                        if (y % 16 < 1 || (x % 32 < 1 && y % 32 >= 16)) {
+                            shade = 0.7;
+                        }
+                        
+                        const finalR = Math.max(0, Math.min(255, (r * shade) + noise));
+                        const finalG = Math.max(0, Math.min(255, (g * shade) + noise));
+                        const finalB = Math.max(0, Math.min(255, (b * shade) + noise));
+                        
+                        texture[y * TEXTURE_SIZE + x] = 0xff000000 | (finalB << 16) | (finalG << 8) | finalR;
+                    }
+                }
+                return texture;
+            }
+            
+            static generateDoorTexture() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        let noise = Math.random() * 20 - 10;
+                        let shade = 1.0;
+                        
+                        // Panneau vertical au centre
+                        if (x > TEXTURE_SIZE * 0.4 && x < TEXTURE_SIZE * 0.6) {
+                            shade = 0.8;
+                        }
+                        
+                        // Ligne horizontale au centre
+                        if (y > TEXTURE_SIZE * 0.48 && y < TEXTURE_SIZE * 0.52) {
+                            shade = 0.6;
+                        }
+                        
+                        // Cadre
+                        if (x < 2 || x >= TEXTURE_SIZE - 2 || y < 2 || y >= TEXTURE_SIZE - 2) {
+                            shade = 0.5;
+                        }
+                        
+                        const baseColor = 120; // Gris métallique
+                        const finalColor = Math.max(0, Math.min(255, (baseColor * shade) + noise));
+                        
+                        texture[y * TEXTURE_SIZE + x] = 0xff000000 | (finalColor << 16) | (finalColor << 8) | finalColor;
+                    }
+                }
+                return texture;
+            }
+            
+            static generateFloorTexture(pattern) {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                // Texture unie pour mieux voir le damier de la grille
+                const color = 80;
+                for (let i = 0; i < TEXTURE_SIZE * TEXTURE_SIZE; i++) {
+                    texture[i] = 0xff000000 | (color << 16) | (color << 8) | color;
+                }
+                return texture;
+            }
+            
+            static generateCeilingTexture() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                // Texture unie pour mieux voir le damier de la grille
+                const color = 40;
+                for (let i = 0; i < TEXTURE_SIZE * TEXTURE_SIZE; i++) {
+                    texture[i] = 0xff000000 | (color << 16) | (color << 8) | color;
+                }
+                return texture;
+            }
+            
+            static generateLampSprite() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                const centerX = TEXTURE_SIZE / 2;
+                const centerY = TEXTURE_SIZE / 2;
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const dx = x - centerX;
+                        const dy = y - centerY;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        
+                        if (dist < 20) {
+                            // Corps de la lampe (jaune brillant)
+                            const intensity = 1 - (dist / 20);
+                            const r = Math.floor(255 * intensity);
+                            const g = Math.floor(200 * intensity);
+                            const b = Math.floor(50 * intensity);
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (b << 16) | (g << 8) | r;
+                        } else if (y > TEXTURE_SIZE * 0.7 && x > TEXTURE_SIZE * 0.4 && x < TEXTURE_SIZE * 0.6) {
+                            // Pied de la lampe
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (40 << 16) | (40 << 8) | 40;
+                        } else {
+                            // Transparent
+                            texture[y * TEXTURE_SIZE + x] = 0x00000000;
+                        }
+                    }
+                }
+                return texture;
+            }
+            
+            static generatePillarSprite() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        if (x >= TEXTURE_SIZE * 0.3 && x <= TEXTURE_SIZE * 0.7) {
+                            // Corps du pilier
+                            let shade = 1.0;
+                            if (x < TEXTURE_SIZE * 0.35 || x > TEXTURE_SIZE * 0.65) {
+                                shade = 0.7;
+                            }
+                            const color = Math.floor(100 * shade);
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (color << 16) | (color << 8) | color;
+                        } else {
+                            // Transparent
+                            texture[y * TEXTURE_SIZE + x] = 0x00000000;
+                        }
+                    }
+                }
+                return texture;
+            }
+            
+            static generatePlantSprite() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                const centerX = TEXTURE_SIZE / 2;
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const dx = Math.abs(x - centerX);
+                        
+                        if (y < TEXTURE_SIZE * 0.6 && dx < (TEXTURE_SIZE * 0.3 * (1 - y / TEXTURE_SIZE))) {
+                            // Feuilles vertes
+                            const noise = Math.random() * 40 - 20;
+                            const g = Math.floor(150 + noise);
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (20 << 16) | (g << 8) | 20;
+                        } else if (y >= TEXTURE_SIZE * 0.6 && y < TEXTURE_SIZE * 0.9 && 
+                                   x >= TEXTURE_SIZE * 0.4 && x <= TEXTURE_SIZE * 0.6) {
+                            // Pot marron
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (40 << 16) | (60 << 8) | 100;
+                        } else {
+                            // Transparent
+                            texture[y * TEXTURE_SIZE + x] = 0x00000000;
+                        }
+                    }
+                }
+                return texture;
+            }
+            
+            static generateArmorSprite() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const centerX = TEXTURE_SIZE / 2;
+                        const dx = Math.abs(x - centerX);
+                        
+                        if (y < TEXTURE_SIZE * 0.7 && dx < TEXTURE_SIZE * 0.3) {
+                            // Armure bleue métallique
+                            let shade = 1.0;
+                            if (y % 8 < 2) shade = 0.8; // Bandes horizontales
+                            
+                            const b = Math.floor(200 * shade);
+                            const g = Math.floor(100 * shade);
+                            const r = Math.floor(50 * shade);
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (b << 16) | (g << 8) | r;
+                        } else {
+                            // Transparent
+                            texture[y * TEXTURE_SIZE + x] = 0x00000000;
+                        }
+                    }
+                }
+                return texture;
+            }
+            
+            static generateHealthSprite() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                const centerX = TEXTURE_SIZE / 2;
+                const centerY = TEXTURE_SIZE / 2;
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        const dx = x - centerX;
+                        const dy = y - centerY;
+                        
+                        // Forme de croix rouge
+                        if ((Math.abs(dx) < 8 && Math.abs(dy) < 20) || 
+                            (Math.abs(dy) < 8 && Math.abs(dx) < 20)) {
+                            texture[y * TEXTURE_SIZE + x] = 0xff000000 | (20 << 16) | (20 << 8) | 200;
+                        } else {
+                            // Transparent
+                            texture[y * TEXTURE_SIZE + x] = 0x00000000;
+                        }
+                    }
+                }
+                return texture;
+            }
+        }
+        
+        // Textures (stockées verticalement pour optimisation cache)
+        const textures = {
+            walls: [
+                TextureGenerator.generateWallTexture(0x804020), // Brun
+                TextureGenerator.generateWallTexture(0x606060), // Gris
+                TextureGenerator.generateWallTexture(0x802020), // Rouge
+                TextureGenerator.generateWallTexture(0x204080), // Bleu
+            ],
+            door: TextureGenerator.generateDoorTexture(),
+            floor: TextureGenerator.generateFloorTexture('stone'),
+            ceiling: TextureGenerator.generateCeilingTexture(),
+            sprites: [
+                TextureGenerator.generateLampSprite(),    // SPRITE_LAMP
+                TextureGenerator.generatePillarSprite(),  // SPRITE_PILLAR
+                TextureGenerator.generatePlantSprite(),   // SPRITE_PLANT
+                TextureGenerator.generateArmorSprite(),   // SPRITE_ARMOR
+                TextureGenerator.generateHealthSprite()   // SPRITE_HEALTH
+            ]
+        };
+        
+        // Transposer les textures murales pour stockage vertical
+        function transposeTexture(texture) {
+            const transposed = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    transposed[x * TEXTURE_SIZE + y] = texture[y * TEXTURE_SIZE + x];
+                }
+            }
+            return transposed;
+        }
+        
+        // Appliquer la transposition aux textures murales et porte
+        textures.walls = textures.walls.map(transposeTexture);
+        textures.door = transposeTexture(textures.door);
+        
+        // Carte du monde avec portes
+        const worldMap = [
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,2,2,2,2,2,0,0,0,0,3,3,3,3,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,2,10,2,2,0,0,0,0,3,3,10,3,3,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,0,0,0,2,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,4,4,10,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        ];
+        
+        // Classe Sprite
+        class Sprite {
+            constructor(x, y, type) {
+                this.x = x;
+                this.y = y;
+                this.type = type;
+                this.distance = 0;
+                this.angle = 0;
+                this.screenX = 0;
+                this.visible = false;
+            }
+            
+            update(playerX, playerY, playerAngle, playerDX, playerDY, planeX, planeY) {
+                // Vecteur du joueur au sprite
+                const spriteX = this.x - playerX;
+                const spriteY = this.y - playerY;
+                
+                // Transformer le sprite dans l'espace caméra
+                // Ceci utilise la matrice inverse de la caméra
+                const invDet = 1.0 / (planeX * playerDY - playerDX * planeY);
+                
+                const transformX = invDet * (playerDY * spriteX - playerDX * spriteY);
+                const transformY = invDet * (-planeY * spriteX + planeX * spriteY);
+                
+                // Distance perpendiculaire (pour le tri et le brouillard)
+                this.distance = transformY;
+                
+                // Vérifier si le sprite est devant nous et dans le champ de vision
+                this.visible = transformY > 0.5 && transformY < MAX_DEPTH;
+                
+                if (this.visible) {
+                    // Calculer la position X sur l'écran
+                    this.screenX = Math.floor((SCREEN_WIDTH / 2) * (1 + transformX / transformY));
+                    
+                    // Vérifier si le sprite est dans les limites de l'écran
+                    const spriteHeight = Math.abs(Math.floor(SCREEN_HEIGHT / transformY));
+                    const spriteWidth = spriteHeight;
+                    const halfWidth = spriteWidth / 2;
+                    
+                    if (this.screenX + halfWidth < 0 || this.screenX - halfWidth >= SCREEN_WIDTH) {
+                        this.visible = false;
+                    }
+                }
+            }
+        }
+        
+        // Système de sprites
+        class SpriteSystem {
+            constructor() {
+                this.sprites = [];
+                this.initSprites();
+            }
+            
+            initSprites() {
+                // Ajouter des sprites dans la map
+                // Lampes
+                this.sprites.push(new Sprite(7.5, 2.5, SPRITE_LAMP));
+                this.sprites.push(new Sprite(16.5, 2.5, SPRITE_LAMP));
+                this.sprites.push(new Sprite(2.5, 10.5, SPRITE_LAMP));
+                this.sprites.push(new Sprite(21.5, 10.5, SPRITE_LAMP));
+                
+                // Piliers
+                this.sprites.push(new Sprite(7.5, 6.5, SPRITE_PILLAR));
+                this.sprites.push(new Sprite(16.5, 6.5, SPRITE_PILLAR));
+                
+                // Plantes
+                this.sprites.push(new Sprite(4.5, 4.5, SPRITE_PLANT));
+                this.sprites.push(new Sprite(19.5, 4.5, SPRITE_PLANT));
+                this.sprites.push(new Sprite(11.5, 11.5, SPRITE_PLANT));
+                this.sprites.push(new Sprite(12.5, 11.5, SPRITE_PLANT));
+                
+                // Objets
+                this.sprites.push(new Sprite(18.5, 18.5, SPRITE_ARMOR));
+                this.sprites.push(new Sprite(5.5, 18.5, SPRITE_HEALTH));
+                this.sprites.push(new Sprite(11.5, 15.5, SPRITE_HEALTH));
+            }
+            
+            updateSprites(playerX, playerY, playerAngle, playerDX, playerDY, planeX, planeY) {
+                for (const sprite of this.sprites) {
+                    sprite.update(playerX, playerY, playerAngle, playerDX, playerDY, planeX, planeY);
+                }
+                
+                // Trier les sprites par distance (du plus loin au plus proche)
+                this.sprites.sort((a, b) => b.distance - a.distance);
+            }
+            
+            renderSprites(pixelBuffer, zBuffer) {
+                let visibleCount = 0;
+                
+                // Précalcul des constantes
+                const halfWidth = SCREEN_WIDTH >> 1;
+                const halfHeight = SCREEN_HEIGHT >> 1;
+                
+                for (const sprite of this.sprites) {
+                    if (!sprite.visible || sprite.distance < 0.5) continue;
+                    
+                    visibleCount++;
+                    
+                    // Calculer la taille du sprite à l'écran
+                    const invDist = 1.0 / sprite.distance;
+                    const spriteHeight = Math.abs(Math.floor(SCREEN_HEIGHT * invDist));
+                    const spriteWidth = spriteHeight; // Sprites carrés
+                    
+                    // Position verticale
+                    const drawStartY = Math.max(0, halfHeight - (spriteHeight >> 1));
+                    const drawEndY = Math.min(SCREEN_HEIGHT, halfHeight + (spriteHeight >> 1));
+                    
+                    // Position horizontale
+                    const halfSpriteWidth = spriteWidth >> 1;
+                    const drawStartX = Math.max(0, sprite.screenX - halfSpriteWidth);
+                    const drawEndX = Math.min(SCREEN_WIDTH, sprite.screenX + halfSpriteWidth);
+                    
+                    // Skip si complètement hors écran
+                    if (drawStartX >= drawEndX || drawStartY >= drawEndY) continue;
+                    
+                    // Texture du sprite
+                    const texture = textures.sprites[sprite.type];
+                    
+                    // Calculer le brouillard une fois
+                    let fogFactor = 0;
+                    if (sprite.distance > FOG_START) {
+                        fogFactor = Math.min(1, (sprite.distance - FOG_START) / (FOG_END - FOG_START));
+                    }
+                    
+                    // Facteurs de texture précalculés
+                    const texStepX = TEXTURE_SIZE / spriteWidth;
+                    const texStepY = TEXTURE_SIZE / spriteHeight;
+                    const texStartX = (drawStartX - sprite.screenX + halfSpriteWidth) * texStepX;
+                    const texStartY = (drawStartY - halfHeight + (spriteHeight >> 1)) * texStepY;
+                    
+                    // Dessiner le sprite par colonnes
+                    for (let x = drawStartX; x < drawEndX; x++) {
+                        // Vérifier le z-buffer une fois par colonne
+                        if (sprite.distance >= zBuffer[x]) continue;
+                        
+                        // Coordonnée X dans la texture
+                        const texX = Math.floor(texStartX + (x - drawStartX) * texStepX);
+                        
+                        // Dessiner la colonne
+                        let yOffset = drawStartY * SCREEN_WIDTH + x;
+                        let texYFloat = texStartY;
+                        
+                        for (let y = drawStartY; y < drawEndY; y++) {
+                            // Coordonnée Y dans la texture
+                            const texY = Math.floor(texYFloat);
+                            
+                            // Récupérer la couleur de la texture
+                            const color = texture[texY * TEXTURE_SIZE + texX];
+                            
+                            // Vérifier la transparence (canal alpha)
+                            if ((color >>> 24) !== 0) {
+                                // Appliquer le brouillard si nécessaire
+                                const finalColor = fogFactor > 0 ? 
+                                    blendColors(color, 0xff000000, fogFactor) : color;
+                                
+                                // Dessiner le pixel
+                                pixelBuffer[yOffset] = finalColor;
+                            }
+                            
+                            yOffset += SCREEN_WIDTH;
+                            texYFloat += texStepY;
+                        }
+                    }
+                }
+                
+                return visibleCount;
+            }
+        }
+        
+        // Instance du système de sprites
+        const spriteSystem = new SpriteSystem();
+        
+        // Système de portes
+        class DoorSystem {
+            constructor() {
+                this.doors = new Map();
+                this.initDoors();
+            }
+            
+            initDoors() {
+                // Parcourir la carte et initialiser les portes
+                for (let x = 0; x < MAP_WIDTH; x++) {
+                    for (let y = 0; y < MAP_HEIGHT; y++) {
+                        if (worldMap[x][y] === CELL_DOOR_NS || worldMap[x][y] === CELL_DOOR_EW) {
+                            const key = `${x},${y}`;
+                            this.doors.set(key, {
+                                x: x,
+                                y: y,
+                                state: DOOR_CLOSED,
+                                timer: 0,
+                                type: worldMap[x][y]
+                            });
+                        }
+                    }
+                }
+            }
+            
+            getDoor(x, y) {
+                return this.doors.get(`${x},${y}`);
+            }
+            
+            updateDoors(deltaTime) {
+                for (const door of this.doors.values()) {
+                    if (door.state === DOOR_OPENING) {
+                        door.timer += deltaTime * DOOR_SPEED;
+                        if (door.timer >= 1.0) {
+                            door.timer = 1.0;
+                            door.state = DOOR_OPEN;
+                        }
+                    } else if (door.state === DOOR_CLOSING) {
+                        door.timer -= deltaTime * DOOR_SPEED;
+                        if (door.timer <= 0) {
+                            door.timer = 0;
+                            door.state = DOOR_CLOSED;
+                        }
+                    }
+                }
+            }
+            
+            tryOpenDoor(playerX, playerY, playerAngle) {
+                // Calculer la position devant le joueur
+                const checkDist = 1.0;
+                const checkX = Math.floor(playerX + Math.cos(playerAngle) * checkDist);
+                const checkY = Math.floor(playerY + Math.sin(playerAngle) * checkDist);
+                
+                const door = this.getDoor(checkX, checkY);
+                if (door) {
+                    if (door.state === DOOR_CLOSED) {
+                        door.state = DOOR_OPENING;
+                    } else if (door.state === DOOR_OPEN) {
+                        door.state = DOOR_CLOSING;
+                    }
+                }
+            }
+            
+            isDoorBlocking(x, y) {
+                const door = this.getDoor(Math.floor(x), Math.floor(y));
+                if (!door) return false;
+                
+                // Si la porte est complètement ouverte, elle ne bloque pas
+                if (door.state === DOOR_OPEN && door.timer >= 0.9) return false;
+                
+                // Vérifier si on est dans la cellule de la porte
+                const cellX = x - Math.floor(x);
+                const cellY = y - Math.floor(y);
+                
+                if (door.type === CELL_DOOR_NS) {
+                    // Porte Nord-Sud : mur mince sur l'axe X au milieu (x = 0.5)
+                    // Bloque si on est proche du milieu en X
+                    return Math.abs(cellX - 0.5) < PLAYER_RADIUS;
+                } else {
+                    // Porte Est-Ouest : mur mince sur l'axe Y au milieu (y = 0.5)
+                    // Bloque si on est proche du milieu en Y
+                    return Math.abs(cellY - 0.5) < PLAYER_RADIUS;
+                }
+            }
+        }
+        
+        // Instance du système de portes
+        const doorSystem = new DoorSystem();
+        
+        // État du joueur
+        const player = {
+            x: 3.5,
+            y: 3.5,
+            angle: 0,
+            dx: 1,     // cos(0)
+            dy: 0,     // sin(0)
+            planeX: 0,   // -sin(0) * 0.66
+            planeY: 0.66,// cos(0) * 0.66
+            moveSpeed: 0,
+            rotSpeed: 0
+        };
+        
+        // Z-buffer pour la profondeur
+        const zBuffer = new Float32Array(SCREEN_WIDTH);
+        
+        // Entrées clavier
+        const keys = {};
+        document.addEventListener('keydown', e => {
+            keys[e.code] = true;
+            if (e.code === 'Space') {
+                doorSystem.tryOpenDoor(player.x, player.y, player.angle);
+            }
+        });
+        document.addEventListener('keyup', e => keys[e.code] = false);
+        
+        // Fonction pour mélanger les couleurs (brouillard) - optimisée
+        function blendColors(color1, color2, factor) {
+            // Clamp factor une seule fois
+            factor = Math.max(0, Math.min(1, factor));
+            const invFactor = 1 - factor;
+            
+            // Extraction et mélange en une seule passe
+            const r = Math.floor((color1 & 0xff) * invFactor + (color2 & 0xff) * factor);
+            const g = Math.floor(((color1 >> 8) & 0xff) * invFactor + ((color2 >> 8) & 0xff) * factor);
+            const b = Math.floor(((color1 >> 16) & 0xff) * invFactor + ((color2 >> 16) & 0xff) * factor);
+            
+            return 0xff000000 | (b << 16) | (g << 8) | r;
+        }
+        
+        // Vérification de collision optimisée
+        function checkCollision(x, y) {
+            // Vérification rapide des limites
+            if (x < PLAYER_RADIUS || x >= MAP_WIDTH - PLAYER_RADIUS || 
+                y < PLAYER_RADIUS || y >= MAP_HEIGHT - PLAYER_RADIUS) {
+                return true;
+            }
+            
+            const mapX = Math.floor(x);
+            const mapY = Math.floor(y);
+            
+            // Vérifier si c'est une porte en premier (plus rapide)
+            if (doorSystem.isDoorBlocking(x, y)) {
+                return true;
+            }
+            
+            // Vérifier seulement les cellules dans le rayon du joueur
+            const minX = Math.floor(x - PLAYER_RADIUS);
+            const maxX = Math.floor(x + PLAYER_RADIUS);
+            const minY = Math.floor(y - PLAYER_RADIUS);
+            const maxY = Math.floor(y + PLAYER_RADIUS);
+            
+            // Boucle optimisée
+            for (let checkX = minX; checkX <= maxX; checkX++) {
+                for (let checkY = minY; checkY <= maxY; checkY++) {
+                    const cell = worldMap[checkX][checkY];
+                    if (cell > 0 && cell < 10) { // Murs normaux
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        
+        // Mise à jour du joueur
+        function updatePlayer(deltaTime) {
+            // Gestion des entrées
+            player.moveSpeed = 0;
+            player.rotSpeed = 0;
+            
+            if (keys['KeyW'] || keys['ArrowUp']) player.moveSpeed = PLAYER_SPEED;
+            if (keys['KeyS'] || keys['ArrowDown']) player.moveSpeed = -PLAYER_SPEED;
+            if (keys['KeyA']) player.moveSpeed = PLAYER_SPEED * 0.7;
+            if (keys['KeyD']) player.moveSpeed = -PLAYER_SPEED * 0.7;
+            if (keys['KeyQ'] || keys['ArrowLeft']) player.rotSpeed = -ROTATION_SPEED;
+            if (keys['KeyE'] || keys['ArrowRight']) player.rotSpeed = ROTATION_SPEED;
+            
+            // Rotation
+            if (player.rotSpeed !== 0) {
+                const oldDirX = player.dx;
+                const oldPlaneX = player.planeX;
+                
+                player.angle += player.rotSpeed * deltaTime;
+                player.angle = (player.angle + 2 * Math.PI) % (2 * Math.PI);
+                
+                // Rotation de la direction
+                player.dx = Math.cos(player.angle);
+                player.dy = Math.sin(player.angle);
+                
+                // Rotation du plan de caméra (perpendiculaire à la direction)
+                player.planeX = -player.dy * 0.66;
+                player.planeY = player.dx * 0.66;
+            }
+            
+            // Déplacement avec collision
+            if (player.moveSpeed !== 0) {
+                const moveX = player.dx * player.moveSpeed * deltaTime;
+                const moveY = player.dy * player.moveSpeed * deltaTime;
+                
+                // Strafe pour A/D
+                let newX = player.x;
+                let newY = player.y;
+                
+                if (keys['KeyA'] || keys['KeyD']) {
+                    const strafeAngle = player.angle + Math.PI / 2;
+                    newX += Math.cos(strafeAngle) * player.moveSpeed * deltaTime;
+                    newY += Math.sin(strafeAngle) * player.moveSpeed * deltaTime;
+                } else {
+                    newX += moveX;
+                    newY += moveY;
+                }
+                
+                // Vérifier collision X et Y séparément pour glissement
+                if (!checkCollision(newX, player.y)) {
+                    player.x = newX;
+                }
+                if (!checkCollision(player.x, newY)) {
+                    player.y = newY;
+                }
+            }
+        }
+        
+        // Rendu du sol et plafond par scanlines horizontales optimisé
+        function renderFloorCeiling() {
+            const fogColor = 0xff000000;
+            const halfHeight = SCREEN_HEIGHT >> 1;
+            const posZ = halfHeight; // 0.5 * SCREEN_HEIGHT
+            
+            // Précalcul des directions des rayons
+            const rayDirX0 = player.dx - player.planeX;
+            const rayDirY0 = player.dy - player.planeY;
+            const rayDirX1 = player.dx + player.planeX;
+            const rayDirY1 = player.dy + player.planeY;
+            
+            // Lookup table pour les couleurs de damier
+            const checkerColors = new Uint32Array([
+                0xff000000 | (60 << 16) | (60 << 8) | 60,    // Noir
+                0xff000000 | (180 << 16) | (180 << 8) | 180  // Blanc
+            ]);
+            const checkerCeilingColors = new Uint32Array([
+                0xff000000 | (30 << 16) | (30 << 8) | 30,    // Noir
+                0xff000000 | (120 << 16) | (120 << 8) | 120  // Blanc
+            ]);
+            
+            // Pour chaque ligne horizontale sous l'horizon
+            for (let y = halfHeight + 1; y < SCREEN_HEIGHT; y++) {
+                // Position verticale actuelle comparée au centre de l'écran
+                const p = y - halfHeight;
+                
+                // Distance horizontale de la caméra au sol pour cette ligne
+                const rowDistance = posZ / p;
+                
+                // Calculer le brouillard
+                const realDistance = rowDistance / SCREEN_HEIGHT;
+                let fogFactor = 0;
+                if (realDistance > FOG_START) {
+                    fogFactor = Math.min(1, (realDistance - FOG_START) / (FOG_END - FOG_START));
+                }
+                
+                // Si complètement dans le brouillard, remplir avec couleur unie
+                if (fogFactor >= 0.95) {
+                    const offset = y * SCREEN_WIDTH;
+                    const ceilingOffset = (SCREEN_HEIGHT - 1 - y) * SCREEN_WIDTH;
+                    
+                    // Utiliser fill pour les grandes zones uniformes
+                    pixelBuffer.fill(fogColor, offset, offset + SCREEN_WIDTH);
+                    pixelBuffer.fill(fogColor, ceilingOffset, ceilingOffset + SCREEN_WIDTH);
+                    continue;
+                }
+                
+                // Calculer les pas pour interpoler le long de la ligne
+                const floorStepX = rowDistance * (rayDirX1 - rayDirX0) / SCREEN_WIDTH;
+                const floorStepY = rowDistance * (rayDirY1 - rayDirY0) / SCREEN_WIDTH;
+                
+                // Coordonnées de départ du sol
+                let floorX = player.x + rowDistance * rayDirX0;
+                let floorY = player.y + rowDistance * rayDirY0;
+                
+                // Indices de pixels
+                const floorOffset = y * SCREEN_WIDTH;
+                const ceilingOffset = (SCREEN_HEIGHT - 1 - y) * SCREEN_WIDTH;
+                
+                // Rendu par blocs de 4 pixels pour optimiser le cache
+                for (let x = 0; x < SCREEN_WIDTH; x += 4) {
+                    for (let i = 0; i < 4 && x + i < SCREEN_WIDTH; i++) {
+                        // Coordonnées de la cellule
+                        const cellX = Math.floor(floorX);
+                        const cellY = Math.floor(floorY);
+                        
+                        // Damier basé sur les coordonnées de la cellule
+                        const checkerIndex = ((cellX + cellY) & 1);
+                        
+                        // Couleurs de base
+                        let floorColor = checkerColors[checkerIndex];
+                        let ceilingColor = checkerCeilingColors[checkerIndex];
+                        
+                        // Marquer les cellules tous les 5 blocs (optimisé)
+                        if ((cellX % 5) === 0) {
+                            if ((cellY % 5) === 0) {
+                                // Intersection : rouge
+                                floorColor = 0xff000000 | (80 << 16) | (20 << 8) | 200;
+                                ceilingColor = 0xff000000 | (40 << 16) | (10 << 8) | 100;
+                            } else {
+                                // Ligne X : vert
+                                floorColor = 0xff000000 | (20 << 16) | (200 << 8) | 20;
+                                ceilingColor = 0xff000000 | (10 << 16) | (100 << 8) | 10;
+                            }
+                        } else if ((cellY % 5) === 0) {
+                            // Ligne Y : bleu
+                            floorColor = 0xff000000 | (200 << 16) | (80 << 8) | 20;
+                            ceilingColor = 0xff000000 | (100 << 16) | (40 << 8) | 10;
+                        }
+                        
+                        // Appliquer le brouillard si nécessaire
+                        if (fogFactor > 0) {
+                            floorColor = blendColors(floorColor, fogColor, fogFactor);
+                            ceilingColor = blendColors(ceilingColor, fogColor, fogFactor);
+                        }
+                        
+                        // Dessiner sol et plafond
+                        pixelBuffer[floorOffset + x + i] = floorColor;
+                        pixelBuffer[ceilingOffset + x + i] = ceilingColor;
+                        
+                        // Avancer le long du rayon
+                        floorX += floorStepX;
+                        floorY += floorStepY;
+                    }
+                }
+            }
+        }
+        
+        // Algorithme DDA optimisé pour le raycasting (modifié pour les portes)
+        function castRayDDA(rayDirX, rayDirY) {
+            // Position de départ
+            let mapX = Math.floor(player.x);
+            let mapY = Math.floor(player.y);
+            
+            // Calculer la longueur d'un pas de rayon
+            const deltaDistX = Math.abs(1 / rayDirX);
+            const deltaDistY = Math.abs(1 / rayDirY);
+            
+            let perpWallDist = Infinity;
+            let finalHit = null;
+            
+            // Calculer le pas et la distance initiale
+            let stepX, stepY;
+            let sideDistX, sideDistY;
+            
+            if (rayDirX < 0) {
+                stepX = -1;
+                sideDistX = (player.x - mapX) * deltaDistX;
+            } else {
+                stepX = 1;
+                sideDistX = (mapX + 1.0 - player.x) * deltaDistX;
+            }
+            
+            if (rayDirY < 0) {
+                stepY = -1;
+                sideDistY = (player.y - mapY) * deltaDistY;
+            } else {
+                stepY = 1;
+                sideDistY = (mapY + 1.0 - player.y) * deltaDistY;
+            }
+            
+            // DDA
+            let hit = false;
+            let side; // 0 = NS wall, 1 = EW wall
+            
+            while (!hit) {
+                // Vérifier d'abord si on a une porte dans cette cellule
+                const cell = worldMap[mapX][mapY];
+                
+                if (cell === CELL_DOOR_NS || cell === CELL_DOOR_EW) {
+                    const door = doorSystem.getDoor(mapX, mapY);
+                    if (door) {
+                        let doorDist;
+                        let doorWallX;
+                        let doorSide;
+                        let doorHit = false;
+                        
+                        if (cell === CELL_DOOR_NS) {
+                            // Porte Nord-Sud : mur vertical au milieu (x = 0.5)
+                            const doorX = mapX + 0.5;
+                            const t = (doorX - player.x) / rayDirX;
+                            
+                            if (t > 0) {
+                                const hitY = player.y + t * rayDirY;
+                                const hitCellY = hitY - mapY;
+                                
+                                if (hitCellY >= 0 && hitCellY <= 1) {
+                                    doorDist = Math.abs(t);
+                                    doorWallX = hitCellY;
+                                    doorSide = 0;
+                                    
+                                    // Vérifier si la porte bloque (animation)
+                                    if (door.timer < 1) {
+                                        const doorBottom = door.timer;
+                                        if (hitCellY >= doorBottom) {
+                                            doorHit = true;
+                                            doorWallX = (hitCellY - doorBottom) / (1 - doorBottom);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Porte Est-Ouest : mur horizontal au milieu (y = 0.5)
+                            const doorY = mapY + 0.5;
+                            const t = (doorY - player.y) / rayDirY;
+                            
+                            if (t > 0) {
+                                const hitX = player.x + t * rayDirX;
+                                const hitCellX = hitX - mapX;
+                                
+                                if (hitCellX >= 0 && hitCellX <= 1) {
+                                    doorDist = Math.abs(t);
+                                    doorWallX = hitCellX;
+                                    doorSide = 1;
+                                    
+                                    // Vérifier si la porte bloque (animation)
+                                    if (door.timer < 1) {
+                                        const doorLeft = door.timer;
+                                        if (hitCellX >= doorLeft) {
+                                            doorHit = true;
+                                            doorWallX = (hitCellX - doorLeft) / (1 - doorLeft);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (doorHit && doorDist < perpWallDist) {
+                            perpWallDist = doorDist;
+                            finalHit = {
+                                perpDist: doorDist,
+                                tile: -1,
+                                textureX: doorWallX,
+                                side: doorSide,
+                                isDoor: true
+                            };
+                        }
+                    }
+                }
+                
+                // Passer au prochain carré de la carte
+                if (sideDistX < sideDistY) {
+                    sideDistX += deltaDistX;
+                    mapX += stepX;
+                    side = 0;
+                } else {
+                    sideDistY += deltaDistY;
+                    mapY += stepY;
+                    side = 1;
+                }
+                
+                // Vérifier les limites
+                if (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT) {
+                    break;
+                }
+                
+                // Vérifier si on a touché un mur normal
+                if (worldMap[mapX][mapY] > 0 && worldMap[mapX][mapY] < 10) {
+                    hit = true;
+                    
+                    // Calculer la distance pour ce mur
+                    let wallDist;
+                    if (side === 0) {
+                        wallDist = (mapX - player.x + (1 - stepX) / 2) / rayDirX;
+                    } else {
+                        wallDist = (mapY - player.y + (1 - stepY) / 2) / rayDirY;
+                    }
+                    
+                    if (wallDist < perpWallDist) {
+                        perpWallDist = wallDist;
+                        
+                        // Calculer wallX
+                        let wallX;
+                        if (side === 0) {
+                            wallX = player.y + wallDist * rayDirY;
+                        } else {
+                            wallX = player.x + wallDist * rayDirX;
+                        }
+                        wallX -= Math.floor(wallX);
+                        
+                        finalHit = {
+                            perpDist: wallDist,
+                            tile: worldMap[mapX][mapY] - 1,
+                            textureX: wallX,
+                            side: side,
+                            isDoor: false
+                        };
+                    }
+                }
+            }
+            
+            return finalHit;
+        }
+        
+        // Rendu des murs
+        function renderWalls() {
+            const stripWidth = Math.ceil(SCREEN_WIDTH / NUM_RAYS);
+            
+            for (let ray = 0; ray < NUM_RAYS; ray++) {
+                // Calculer la position du rayon dans l'espace caméra (-1 à 1)
+                const cameraX = 2 * ray / NUM_RAYS - 1;
+                
+                // Direction du rayon
+                const rayDirX = player.dx + player.planeX * cameraX;
+                const rayDirY = player.dy + player.planeY * cameraX;
+                
+                const hit = castRayDDA(rayDirX, rayDirY);
+                
+                if (!hit) {
+                    continue;
+                }
+                
+                // Pas de correction fish-eye nécessaire avec cette méthode
+                const perpWallDist = hit.perpDist;
+                
+                // Hauteur du mur projeté
+                const wallHeight = Math.floor((SCREEN_HEIGHT / perpWallDist));
+                const drawStart = Math.floor((SCREEN_HEIGHT - wallHeight) / 2);
+                const drawEnd = drawStart + wallHeight;
+                
+                // Calculer le brouillard
+                let fogFactor = 0;
+                if (perpWallDist > FOG_START) {
+                    fogFactor = Math.min(1, (perpWallDist - FOG_START) / (FOG_END - FOG_START));
+                }
+                
+                // Position X dans la texture
+                const texX = Math.floor(hit.textureX * TEXTURE_SIZE) & (TEXTURE_SIZE - 1);
+                
+                // Obtenir la texture appropriée
+                const texture = hit.isDoor ? textures.door : textures.walls[hit.tile % textures.walls.length];
+                
+                // Assombrir selon le côté (éclairage simple)
+                const darkness = hit.side === 1 ? 0.7 : 1.0;
+                
+                // Dessiner la colonne de mur
+                const screenX = ray * stripWidth;
+                
+                for (let x = 0; x < stripWidth; x++) {
+                    const currentX = screenX + x;
+                    if (currentX >= SCREEN_WIDTH) break;
+                    
+                    // Stocker la distance pour le z-buffer
+                    zBuffer[currentX] = perpWallDist;
+                    
+                    for (let y = Math.max(0, drawStart); y < Math.min(SCREEN_HEIGHT, drawEnd); y++) {
+                        const d = y - drawStart;
+                        const texY = Math.floor((d * TEXTURE_SIZE) / wallHeight) & (TEXTURE_SIZE - 1);
+                        
+                        // Récupérer la couleur de la texture (stockage vertical)
+                        let color = texture[texX * TEXTURE_SIZE + texY];
+                        
+                        // Appliquer l'éclairage
+                        if (darkness < 1.0) {
+                            const r = color & 0xff;
+                            const g = (color >> 8) & 0xff;
+                            const b = (color >> 16) & 0xff;
+                            
+                            color = 0xff000000 | 
+                                    ((Math.floor(b * darkness)) << 16) | 
+                                    ((Math.floor(g * darkness)) << 8) | 
+                                    Math.floor(r * darkness);
+                        }
+                        
+                        // Appliquer le brouillard
+                        if (fogFactor > 0) {
+                            color = blendColors(color, 0xff000000, fogFactor);
+                        }
+                        
+                        pixelBuffer[y * SCREEN_WIDTH + currentX] = color;
+                    }
+                }
+            }
+        }
+        
+        // Effacer l'écran
+        function clearScreen() {
+            pixelBuffer.fill(0xff000000);
+        }
+        
+        // Rendu principal
+        function render() {
+            clearScreen();
+            renderFloorCeiling();
+            renderWalls();
+            
+            // Mettre à jour et rendre les sprites
+            spriteSystem.updateSprites(player.x, player.y, player.angle, player.dx, player.dy, player.planeX, player.planeY);
+            const visibleSprites = spriteSystem.renderSprites(pixelBuffer, zBuffer);
+            document.getElementById('sprites').textContent = visibleSprites;
+            
+            // Appliquer le buffer à l'écran
+            ctx.putImageData(imageData, 0, 0);
+        }
+        
+        // Variables pour le calcul des FPS
+        let lastTime = performance.now();
+        let frameCount = 0;
+        let fpsTime = 0;
+        
+        // Boucle de jeu principale
+        function gameLoop(currentTime) {
+            // Calculer le delta time
+            const deltaTime = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+            
+            // Mise à jour des FPS
+            frameCount++;
+            fpsTime += deltaTime;
+            if (fpsTime >= 1.0) {
+                document.getElementById('fps').textContent = Math.round(frameCount / fpsTime);
+                frameCount = 0;
+                fpsTime = 0;
+            }
+            
+            // Mise à jour de la position et des portes
+            document.getElementById('pos').textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}`;
+            document.getElementById('cell').textContent = `${Math.floor(player.x)}, ${Math.floor(player.y)}`;
+            document.getElementById('rays').textContent = NUM_RAYS;
+            
+            // Compter les portes actives
+            let activeDoors = 0;
+            for (const door of doorSystem.doors.values()) {
+                if (door.state === DOOR_OPENING || door.state === DOOR_CLOSING) {
+                    activeDoors++;
+                }
+            }
+            document.getElementById('doors').textContent = activeDoors;
+            
+            // Mise à jour et rendu
+            updatePlayer(deltaTime);
+            doorSystem.updateDoors(deltaTime);
+            render();
+            
+            requestAnimationFrame(gameLoop);
+        }
+        
+        // Démarrer le jeu
+        console.log('Raycaster Wolfenstein 3D avec Portes et Sprites démarré!');
+        console.log('Optimisations actives:');
+        console.log('- Tables trigonométriques précalculées');
+        console.log('- Stockage vertical des textures');
+        console.log('- Manipulation directe des pixels via Uint32Array');
+        console.log('- Rendu du sol/plafond par scanlines horizontales');
+        console.log('- Système de brouillard pour limiter la distance de rendu');
+        console.log('- Plan de caméra pour projection correcte');
+        console.log('- DDA optimisé pour le raycasting');
+        console.log(`- Nombre de rayons réduit: ${NUM_RAYS} au lieu de ${SCREEN_WIDTH}`);
+        console.log('- Système de portes avec animation et collision');
+        console.log('- Système de sprites avec billboards et z-ordering');
+        
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>

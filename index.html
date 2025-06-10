@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raycaster Wolfenstein 3D Optimisé</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: monospace;
+            color: #fff;
+        }
+        #gameContainer {
+            position: relative;
+        }
+        canvas {
+            border: 2px solid #333;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="gameContainer">
+        <canvas id="canvas"></canvas>
+        <div id="info">
+            <div>FPS: <span id="fps">0</span></div>
+            <div>Position: <span id="pos">0, 0</span></div>
+            <div>Cellule: <span id="cell">0, 0</span></div>
+            <div>Rayons: <span id="rays">0</span></div>
+        </div>
+        <div id="controls">
+            WASD: Déplacement | Q/E: Rotation | ↑↓: Avancer/Reculer | ←→: Tourner
+        </div>
+    </div>
+
+    <script>
+        const SCREEN_WIDTH = 640;
+        const SCREEN_HEIGHT = 400;
+        const TEXTURE_SIZE = 64;
+        const MAP_WIDTH = 24;
+        const MAP_HEIGHT = 24;
+        const FOV = Math.PI / 3; // 60 degrés
+        const HALF_FOV = FOV / 2;
+        const NUM_RAYS = Math.floor(SCREEN_WIDTH / 2); // Optimisation: moins de rayons
+        const MAX_DEPTH = 20;
+        const FOG_START = 6;
+        const FOG_END = 12;
+        const PLAYER_SPEED = 3.5;
+        const ROTATION_SPEED = 2.5;
+        const PLAYER_RADIUS = 0.25;
+        
+        // Canvas et contexte
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = SCREEN_WIDTH;
+        canvas.height = SCREEN_HEIGHT;
+        
+        // Buffer de pixels pour manipulation directe
+        let imageData = ctx.createImageData(SCREEN_WIDTH, SCREEN_HEIGHT);
+        let pixelBuffer = new Uint32Array(imageData.data.buffer);
+        
+        // Tables de précalcul
+        const sinTable = new Float32Array(360);
+        const cosTable = new Float32Array(360);
+        const tanTable = new Float32Array(360);
+        
+        // Initialisation des tables trigonométriques
+        for (let i = 0; i < 360; i++) {
+            const angle = (i * Math.PI) / 180;
+            sinTable[i] = Math.sin(angle);
+            cosTable[i] = Math.cos(angle);
+            tanTable[i] = Math.tan(angle);
+        }
+        
+        // Génération de textures aléatoires
+        class TextureGenerator {
+            static generateWallTexture(baseColor) {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                const r = (baseColor >> 16) & 0xff;
+                const g = (baseColor >> 8) & 0xff;
+                const b = baseColor & 0xff;
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        let noise = Math.random() * 30 - 15;
+                        let shade = 1.0;
+                        
+                        // Motif de briques amélioré
+                        const brickHeight = 8;
+                        const brickWidth = 16;
+                        const mortarSize = 1;
+                        
+                        const brickY = y % (brickHeight * 2);
+                        const brickX = x % brickWidth;
+                        const row = Math.floor(y / brickHeight);
+                        
+                        // Décalage des briques sur les rangées impaires
+                        const offset = (row % 2) * (brickWidth / 2);
+                        const adjustedX = (x + offset) % (brickWidth * 2);
+                        
+                        // Mortier horizontal
+                        if (brickY < mortarSize || brickY >= brickHeight - mortarSize && brickY < brickHeight + mortarSize) {
+                            shade = 0.5;
+                        }
+                        // Mortier vertical
+                        else if (adjustedX % brickWidth < mortarSize) {
+                            shade = 0.5;
+                        }
+                        
+                        // Variation de couleur par brique
+                        const brickId = row * 100 + Math.floor(adjustedX / brickWidth);
+                        const brickVariation = ((brickId * 7) % 11) * 0.02;
+                        shade += brickVariation;
+                        
+                        const finalR = Math.max(0, Math.min(255, (r * shade) + noise));
+                        const finalG = Math.max(0, Math.min(255, (g * shade) + noise));
+                        const finalB = Math.max(0, Math.min(255, (b * shade) + noise));
+                        
+                        texture[y * TEXTURE_SIZE + x] = 0xff000000 | (finalB << 16) | (finalG << 8) | finalR;
+                    }
+                }
+                return texture;
+            }
+            
+            static generateFloorTexture(pattern) {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        let value = 0;
+                        
+                        // Texture de dalles de pierre
+                        const tileSize = 16;
+                        const tx = x % tileSize;
+                        const ty = y % tileSize;
+                        
+                        // Base de la dalle
+                        value = 80 + Math.random() * 20;
+                        
+                        // Joints entre les dalles
+                        if (tx === 0 || tx === tileSize - 1 || ty === 0 || ty === tileSize - 1) {
+                            value *= 0.5;
+                        }
+                        
+                        // Variation de couleur par dalle
+                        const tileX = Math.floor(x / tileSize);
+                        const tileY = Math.floor(y / tileSize);
+                        const tileVariation = ((tileX * 3 + tileY * 7) % 13) * 5;
+                        value += tileVariation;
+                        
+                        // Bruit pour la texture
+                        value += Math.random() * 10 - 5;
+                        
+                        const color = Math.max(0, Math.min(255, Math.floor(value)));
+                        texture[y * TEXTURE_SIZE + x] = 0xff000000 | (color << 16) | ((color * 0.9) << 8) | (color * 0.8);
+                    }
+                }
+                return texture;
+            }
+            
+            static generateCeilingTexture() {
+                const texture = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+                
+                for (let y = 0; y < TEXTURE_SIZE; y++) {
+                    for (let x = 0; x < TEXTURE_SIZE; x++) {
+                        // Texture de plafond avec poutres en bois
+                        let value = 50;
+                        
+                        // Poutres principales
+                        if ((x % 32 < 6) || (y % 32 < 6)) {
+                            value = 20;
+                        }
+                        
+                        // Planches entre les poutres
+                        if (x % 8 < 1) {
+                            value -= 10;
+                        }
+                        
+                        // Grain du bois
+                        value += Math.sin(x * 0.1) * 5 + Math.sin(y * 0.05) * 3;
+                        
+                        // Bruit
+                        value += Math.random() * 8 - 4;
+                        
+                        const color = Math.max(0, Math.min(255, Math.floor(value)));
+                        texture[y * TEXTURE_SIZE + x] = 0xff000000 | ((color * 0.7) << 16) | ((color * 0.6) << 8) | (color * 0.5);
+                    }
+                }
+                return texture;
+            }
+        }
+        
+        // Textures (stockées verticalement pour optimisation cache)
+        const textures = {
+            walls: [
+                TextureGenerator.generateWallTexture(0xB87333), // Brun clair (brique)
+                TextureGenerator.generateWallTexture(0x696969), // Gris (pierre)
+                TextureGenerator.generateWallTexture(0x8B4513), // Brun foncé (bois)
+                TextureGenerator.generateWallTexture(0x4682B4), // Bleu acier
+            ],
+            floor: TextureGenerator.generateFloorTexture('stone'),
+            ceiling: TextureGenerator.generateCeilingTexture()
+        };
+        
+        // Transposer les textures murales pour stockage vertical
+        function transposeTexture(texture) {
+            const transposed = new Uint32Array(TEXTURE_SIZE * TEXTURE_SIZE);
+            for (let y = 0; y < TEXTURE_SIZE; y++) {
+                for (let x = 0; x < TEXTURE_SIZE; x++) {
+                    transposed[x * TEXTURE_SIZE + y] = texture[y * TEXTURE_SIZE + x];
+                }
+            }
+            return transposed;
+        }
+        
+        // Appliquer la transposition aux textures murales
+        textures.walls = textures.walls.map(transposeTexture);
+        
+        // Carte du monde
+        const worldMap = [
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,2,2,2,2,2,0,0,0,0,3,3,3,3,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,0,0,0,2,0,0,0,0,3,0,0,0,3,0,0,0,0,1],
+            [1,0,0,0,0,2,2,0,2,2,0,0,0,0,3,3,0,3,3,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,4,4,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,0,0,0,2,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,4,4,4,4,4,4,4,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+            [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+        ];
+        
+        // État du joueur
+        const player = {
+            x: 12,
+            y: 12,
+            angle: Math.PI / 4,
+            dx: Math.cos(Math.PI / 4),     // cos(PI/4)
+            dy: Math.sin(Math.PI / 4),     // sin(PI/4)
+            planeX: -Math.sin(Math.PI / 4) * 0.66,   // -sin(PI/4) * 0.66
+            planeY: Math.cos(Math.PI / 4) * 0.66,    // cos(PI/4) * 0.66
+            moveSpeed: 0,
+            rotSpeed: 0
+        };
+        
+        // Z-buffer pour la profondeur
+        const zBuffer = new Float32Array(SCREEN_WIDTH);
+        
+        // Entrées clavier
+        const keys = {};
+        document.addEventListener('keydown', e => keys[e.code] = true);
+        document.addEventListener('keyup', e => keys[e.code] = false);
+        
+        // Fonction pour mélanger les couleurs (brouillard)
+        function blendColors(color1, color2, factor) {
+            factor = Math.max(0, Math.min(1, factor));
+            const r1 = color1 & 0xff;
+            const g1 = (color1 >> 8) & 0xff;
+            const b1 = (color1 >> 16) & 0xff;
+            const r2 = color2 & 0xff;
+            const g2 = (color2 >> 8) & 0xff;
+            const b2 = (color2 >> 16) & 0xff;
+            
+            const r = Math.floor(r1 * (1 - factor) + r2 * factor);
+            const g = Math.floor(g1 * (1 - factor) + g2 * factor);
+            const b = Math.floor(b1 * (1 - factor) + b2 * factor);
+            
+            return 0xff000000 | (b << 16) | (g << 8) | r;
+        }
+        
+        // Vérification de collision
+        function checkCollision(x, y) {
+            const mapX = Math.floor(x);
+            const mapY = Math.floor(y);
+            
+            // Vérifier les 4 coins du cercle du joueur
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const checkX = Math.floor(x + dx * PLAYER_RADIUS);
+                    const checkY = Math.floor(y + dy * PLAYER_RADIUS);
+                    
+                    if (checkX < 0 || checkX >= MAP_WIDTH || 
+                        checkY < 0 || checkY >= MAP_HEIGHT ||
+                        worldMap[checkX][checkY] > 0) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        
+        // Mise à jour du joueur
+        function updatePlayer(deltaTime) {
+            // Gestion des entrées
+            player.moveSpeed = 0;
+            player.rotSpeed = 0;
+            
+            if (keys['KeyW'] || keys['ArrowUp']) player.moveSpeed = PLAYER_SPEED;
+            if (keys['KeyS'] || keys['ArrowDown']) player.moveSpeed = -PLAYER_SPEED;
+            if (keys['KeyA']) player.moveSpeed = PLAYER_SPEED * 0.7;
+            if (keys['KeyD']) player.moveSpeed = -PLAYER_SPEED * 0.7;
+            if (keys['KeyQ'] || keys['ArrowLeft']) player.rotSpeed = -ROTATION_SPEED;
+            if (keys['KeyE'] || keys['ArrowRight']) player.rotSpeed = ROTATION_SPEED;
+            
+            // Rotation
+            if (player.rotSpeed !== 0) {
+                const oldDirX = player.dx;
+                const oldPlaneX = player.planeX;
+                
+                player.angle += player.rotSpeed * deltaTime;
+                player.angle = (player.angle + 2 * Math.PI) % (2 * Math.PI);
+                
+                // Rotation de la direction
+                player.dx = Math.cos(player.angle);
+                player.dy = Math.sin(player.angle);
+                
+                // Rotation du plan de caméra (perpendiculaire à la direction)
+                player.planeX = -player.dy * 0.66;
+                player.planeY = player.dx * 0.66;
+            }
+            
+            // Déplacement avec collision
+            if (player.moveSpeed !== 0) {
+                const moveX = player.dx * player.moveSpeed * deltaTime;
+                const moveY = player.dy * player.moveSpeed * deltaTime;
+                
+                // Strafe pour A/D
+                let newX = player.x;
+                let newY = player.y;
+                
+                if (keys['KeyA'] || keys['KeyD']) {
+                    const strafeAngle = player.angle + Math.PI / 2;
+                    newX += Math.cos(strafeAngle) * player.moveSpeed * deltaTime;
+                    newY += Math.sin(strafeAngle) * player.moveSpeed * deltaTime;
+                } else {
+                    newX += moveX;
+                    newY += moveY;
+                }
+                
+                // Vérifier collision X et Y séparément pour glissement
+                if (!checkCollision(newX, player.y)) {
+                    player.x = newX;
+                }
+                if (!checkCollision(player.x, newY)) {
+                    player.y = newY;
+                }
+            }
+        }
+        
+        // Rendu du sol et plafond par scanlines horizontales
+        function renderFloorCeiling() {
+            const fogColor = 0xff000000;
+            
+            // Pour chaque ligne horizontale sous l'horizon
+            for (let y = SCREEN_HEIGHT / 2 + 1; y < SCREEN_HEIGHT; y++) {
+                // rayDir pour le pixel le plus à gauche (x = 0) et le plus à droite (x = width)
+                const rayDirX0 = player.dx - player.planeX;
+                const rayDirY0 = player.dy - player.planeY;
+                const rayDirX1 = player.dx + player.planeX;
+                const rayDirY1 = player.dy + player.planeY;
+                
+                // Position verticale actuelle comparée au centre de l'écran
+                const p = y - SCREEN_HEIGHT / 2;
+                
+                // Distance horizontale de la caméra au sol pour cette ligne
+                const posZ = 0.5 * SCREEN_HEIGHT; // Hauteur de la caméra
+                const rowDistance = posZ / p;
+                
+                // Calculer le brouillard
+                const realDistance = rowDistance / SCREEN_HEIGHT;
+                let fogFactor = 0;
+                if (realDistance > FOG_START) {
+                    fogFactor = Math.min(1, (realDistance - FOG_START) / (FOG_END - FOG_START));
+                }
+                
+                // Si complètement dans le brouillard, remplir avec couleur unie
+                if (fogFactor >= 0.95) {
+                    const offset = y * SCREEN_WIDTH;
+                    const ceilingOffset = (SCREEN_HEIGHT - 1 - y) * SCREEN_WIDTH;
+                    for (let x = 0; x < SCREEN_WIDTH; x++) {
+                        pixelBuffer[offset + x] = fogColor;
+                        pixelBuffer[ceilingOffset + x] = fogColor;
+                    }
+                    continue;
+                }
+                
+                // Calculer les pas pour interpoler le long de la ligne
+                const floorStepX = rowDistance * (rayDirX1 - rayDirX0) / SCREEN_WIDTH;
+                const floorStepY = rowDistance * (rayDirY1 - rayDirY0) / SCREEN_WIDTH;
+                
+                // Coordonnées de départ du sol
+                let floorX = player.x + rowDistance * rayDirX0;
+                let floorY = player.y + rowDistance * rayDirY0;
+                
+                for (let x = 0; x < SCREEN_WIDTH; x++) {
+                    // Coordonnées de la cellule
+                    const cellX = Math.floor(floorX);
+                    const cellY = Math.floor(floorY);
+                    
+                    // Coordonnées de texture
+                    const texX = Math.floor((floorX - cellX) * TEXTURE_SIZE) & (TEXTURE_SIZE - 1);
+                    const texY = Math.floor((floorY - cellY) * TEXTURE_SIZE) & (TEXTURE_SIZE - 1);
+                    
+                    // Récupérer la couleur de texture
+                    let floorColor = textures.floor[texY * TEXTURE_SIZE + texX];
+                    let ceilingColor = textures.ceiling[texY * TEXTURE_SIZE + texX];
+                    
+                    // Appliquer le brouillard
+                    if (fogFactor > 0) {
+                        floorColor = blendColors(floorColor, fogColor, fogFactor);
+                        ceilingColor = blendColors(ceilingColor, fogColor, fogFactor);
+                    }
+                    
+                    // Dessiner sol et plafond
+                    pixelBuffer[y * SCREEN_WIDTH + x] = floorColor;
+                    pixelBuffer[(SCREEN_HEIGHT - 1 - y) * SCREEN_WIDTH + x] = ceilingColor;
+                    
+                    // Avancer le long du rayon
+                    floorX += floorStepX;
+                    floorY += floorStepY;
+                }
+            }
+        }
+        
+        // Algorithme DDA optimisé pour le raycasting
+        function castRayDDA(rayDirX, rayDirY) {
+            // Position de départ
+            let mapX = Math.floor(player.x);
+            let mapY = Math.floor(player.y);
+            
+            // Calculer la longueur d'un pas de rayon
+            const deltaDistX = Math.abs(1 / rayDirX);
+            const deltaDistY = Math.abs(1 / rayDirY);
+            
+            let perpWallDist;
+            
+            // Calculer le pas et la distance initiale
+            let stepX, stepY;
+            let sideDistX, sideDistY;
+            
+            if (rayDirX < 0) {
+                stepX = -1;
+                sideDistX = (player.x - mapX) * deltaDistX;
+            } else {
+                stepX = 1;
+                sideDistX = (mapX + 1.0 - player.x) * deltaDistX;
+            }
+            
+            if (rayDirY < 0) {
+                stepY = -1;
+                sideDistY = (player.y - mapY) * deltaDistY;
+            } else {
+                stepY = 1;
+                sideDistY = (mapY + 1.0 - player.y) * deltaDistY;
+            }
+            
+            // DDA
+            let hit = false;
+            let side; // 0 = NS wall, 1 = EW wall
+            
+            while (!hit) {
+                // Passer au prochain carré de la carte
+                if (sideDistX < sideDistY) {
+                    sideDistX += deltaDistX;
+                    mapX += stepX;
+                    side = 0;
+                } else {
+                    sideDistY += deltaDistY;
+                    mapY += stepY;
+                    side = 1;
+                }
+                
+                // Vérifier si on a touché un mur
+                if (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT) {
+                    return null;
+                }
+                
+                if (worldMap[mapX][mapY] > 0) {
+                    hit = true;
+                }
+            }
+            
+            // Calculer la distance perpendiculaire
+            if (side === 0) {
+                perpWallDist = (mapX - player.x + (1 - stepX) / 2) / rayDirX;
+            } else {
+                perpWallDist = (mapY - player.y + (1 - stepY) / 2) / rayDirY;
+            }
+            
+            // Calculer la position exacte où le mur a été touché
+            let wallX;
+            if (side === 0) {
+                wallX = player.y + perpWallDist * rayDirY;
+            } else {
+                wallX = player.x + perpWallDist * rayDirX;
+            }
+            wallX -= Math.floor(wallX);
+            
+            return {
+                perpDist: perpWallDist,
+                tile: worldMap[mapX][mapY] - 1,
+                textureX: wallX,
+                side: side
+            };
+        }
+        
+        // Rendu des murs
+        function renderWalls() {
+            const stripWidth = Math.ceil(SCREEN_WIDTH / NUM_RAYS);
+            
+            for (let ray = 0; ray < NUM_RAYS; ray++) {
+                // Calculer la position du rayon dans l'espace caméra (-1 à 1)
+                const cameraX = 2 * ray / NUM_RAYS - 1;
+                
+                // Direction du rayon
+                const rayDirX = player.dx + player.planeX * cameraX;
+                const rayDirY = player.dy + player.planeY * cameraX;
+                
+                const hit = castRayDDA(rayDirX, rayDirY);
+                
+                if (!hit) {
+                    continue;
+                }
+                
+                // Pas de correction fish-eye nécessaire avec cette méthode
+                const perpWallDist = hit.perpDist;
+                
+                // Hauteur du mur projeté
+                const wallHeight = Math.floor((SCREEN_HEIGHT / perpWallDist) * 1.2);
+                const drawStart = Math.floor((SCREEN_HEIGHT - wallHeight) / 2);
+                const drawEnd = drawStart + wallHeight;
+                
+                // Calculer le brouillard
+                let fogFactor = 0;
+                if (perpWallDist > FOG_START) {
+                    fogFactor = Math.min(1, (perpWallDist - FOG_START) / (FOG_END - FOG_START));
+                }
+                
+                // Position X dans la texture
+                const texX = Math.floor(hit.textureX * TEXTURE_SIZE) & (TEXTURE_SIZE - 1);
+                
+                // Obtenir la texture appropriée
+                const texture = textures.walls[hit.tile % textures.walls.length];
+                
+                // Assombrir selon le côté (éclairage simple)
+                const darkness = hit.side === 0 ? 0.8 : 1.0;
+                
+                // Dessiner la colonne de mur
+                const screenX = ray * stripWidth;
+                
+                for (let x = 0; x < stripWidth; x++) {
+                    const currentX = screenX + x;
+                    if (currentX >= SCREEN_WIDTH) break;
+                    
+                    // Stocker la distance pour le z-buffer
+                    zBuffer[currentX] = perpWallDist;
+                    
+                    for (let y = Math.max(0, drawStart); y < Math.min(SCREEN_HEIGHT, drawEnd); y++) {
+                        const d = y - drawStart;
+                        const texY = Math.floor((d * TEXTURE_SIZE) / wallHeight) & (TEXTURE_SIZE - 1);
+                        
+                        // Récupérer la couleur de la texture (stockage vertical)
+                        let color = texture[texX * TEXTURE_SIZE + texY];
+                        
+                        // Appliquer l'éclairage
+                        if (darkness < 1.0) {
+                            const r = color & 0xff;
+                            const g = (color >> 8) & 0xff;
+                            const b = (color >> 16) & 0xff;
+                            
+                            color = 0xff000000 | 
+                                    ((Math.floor(b * darkness)) << 16) | 
+                                    ((Math.floor(g * darkness)) << 8) | 
+                                    Math.floor(r * darkness);
+                        }
+                        
+                        // Appliquer le brouillard
+                        if (fogFactor > 0) {
+                            color = blendColors(color, 0xff000000, fogFactor);
+                        }
+                        
+                        pixelBuffer[y * SCREEN_WIDTH + currentX] = color;
+                    }
+                }
+            }
+        }
+        
+        // Effacer l'écran
+        function clearScreen() {
+            pixelBuffer.fill(0xff000000);
+        }
+        
+        // Rendu principal
+        function render() {
+            clearScreen();
+            renderFloorCeiling();
+            renderWalls();
+            
+            // Appliquer le buffer à l'écran
+            ctx.putImageData(imageData, 0, 0);
+        }
+        
+        // Variables pour le calcul des FPS
+        let lastTime = performance.now();
+        let frameCount = 0;
+        let fpsTime = 0;
+        
+        // Boucle de jeu principale
+        function gameLoop(currentTime) {
+            // Calculer le delta time
+            const deltaTime = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+            
+            // Mise à jour des FPS
+            frameCount++;
+            fpsTime += deltaTime;
+            if (fpsTime >= 1.0) {
+                document.getElementById('fps').textContent = Math.round(frameCount / fpsTime);
+                frameCount = 0;
+                fpsTime = 0;
+            }
+            
+            // Mise à jour de la position
+            document.getElementById('pos').textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}`;
+            document.getElementById('cell').textContent = `${Math.floor(player.x)}, ${Math.floor(player.y)}`;
+            document.getElementById('rays').textContent = NUM_RAYS;
+            
+            // Mise à jour et rendu
+            updatePlayer(deltaTime);
+            render();
+            
+            requestAnimationFrame(gameLoop);
+        }
+        
+        // Démarrer le jeu
+        console.log('%c🎮 Raycaster Wolfenstein 3D Optimisé 🎮', 'font-size: 20px; color: #4682B4;');
+        console.log('%cOptimisations actives:', 'font-weight: bold; color: #90EE90;');
+        console.log('✓ Tables trigonométriques précalculées');
+        console.log('✓ Stockage vertical des textures pour cache optimal');
+        console.log('✓ Manipulation directe des pixels via Uint32Array');
+        console.log('✓ Rendu du sol/plafond par scanlines horizontales');
+        console.log('✓ Système de brouillard pour limiter la distance de rendu');
+        console.log('✓ Plan de caméra pour projection perspective correcte');
+        console.log('✓ Algorithme DDA optimisé pour le raycasting');
+        console.log(`✓ Nombre de rayons optimisé: ${NUM_RAYS} (au lieu de ${SCREEN_WIDTH})`);
+        console.log('%cPrêt à jouer! Utilisez WASD pour bouger, Q/E pour tourner.', 'color: #FFD700; font-style: italic;');
+        
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
